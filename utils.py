@@ -5,6 +5,7 @@ import scipy
 import tensorflow as tf
 from sklearn import preprocessing as prep
 import pandas as pd
+import scipy.sparse as sp
 
 
 class timer(object):
@@ -181,44 +182,44 @@ def batch_eval_recall(_sess, tf_eval, eval_feed_dict, recall_k, eval_data):
     :param eval_data: EvalData instance
     :return: recall array at thresholds matching recall_k
     """
+
+    # 在测试集上得到预测结果 user-item
     tf_eval_preds_batch = []
     for (batch, (eval_start, eval_stop)) in enumerate(eval_data.eval_batch):
-        tf_eval_preds = _sess.run(tf_eval,
-                                  feed_dict=eval_feed_dict(
-                                      batch, eval_start, eval_stop, eval_data))
+        tf_eval_preds = _sess.run(tf_eval, feed_dict=eval_feed_dict(batch, eval_start, eval_stop, eval_data))
         tf_eval_preds_batch.append(tf_eval_preds)
     tf_eval_preds = np.concatenate(tf_eval_preds_batch)
+    # 为啥这里要加这一句？
     tf.local_variables_initializer().run()
 
     # filter non-zero targets
-    y_nz = [len(x) > 0 for x in eval_data.R_test_inf.rows]
-    y_nz = np.arange(len(eval_data.R_test_inf.rows))[y_nz]
-
+    # 这里的filter没啥用吧，其实过滤掉了1个user, 在lastFM里
+    # 原因是: 测试集中有不属于训练集的item, 关于这些item的interactions就被扔掉了
+    #        碰巧的是, 这些item恰好囊括了测试集中某user所有的邻接item
+    y_nz = [len(x) > 0 for x in eval_data.R_test_inf.rows]  # bool vector
+    y_nz = np.arange(len(eval_data.R_test_inf.rows))[y_nz]  # index vector
     preds_all = tf_eval_preds[y_nz, :]
 
     recall = []
     precision = []
     ndcg = []
     for at_k in recall_k:
-        preds_k = preds_all[:, :at_k]
         y = eval_data.R_test_inf[y_nz, :]
 
-        x = scipy.sparse.lil_matrix(y.shape)
-        x.rows = preds_k
-        x.data = np.ones_like(preds_k)
+        preds_k = preds_all[:, :at_k]  # 排过序排过序，tf_eval是通过tf.nn.top_k得到的下标数组
+        row = np.array([[i] * at_k for i in range(len(preds_k))], dtype=np.int).flatten()
+        col = preds_k.flatten()
+        x = sp.coo_matrix((np.ones(preds_k.size), (row, col)), shape=y.shape)  # @k all test predictions
 
-        z = y.multiply(x)
-        recall.append(np.mean(np.divide((np.sum(z, 1)), np.sum(y, 1))))
+        z = y.multiply(x)  # @k test predictions filtered by interactions
+        recall.append(np.mean(np.divide(np.sum(z, 1), np.sum(y, 1))))
         precision.append(np.mean(np.sum(z, 1) / at_k))
 
-        x_coo = x.tocoo()
-        rows = x_coo.row
-        cols = x_coo.col
-        y_csr = y.tocsr()
-        dcg_array = y_csr[(rows, cols)].A1.reshape((preds_k.shape[0], -1))
-        dcg = np.sum(dcg_array * idcg_array[:at_k].reshape((1, -1)), axis=1)
-        idcg = np.sum(y, axis=1) - 1
-        idcg[np.where(idcg >= at_k)] = at_k-1
+        x.data = (np.ones_like(preds_k) * idcg_array[:at_k].reshape((1, -1))).flatten()  # give weights to @n items
+        z = y.multiply(x)  # @k test predictions with rank weights filtered by interactions
+        dcg = np.sum(z, axis=1)
+        idcg = np.sum(y, axis=1) - 1  # -1是因为idcg_table的下标
+        idcg[idcg >= at_k] = at_k - 1
         idcg = idcg_table[idcg.astype(int)]
         ndcg.append(np.mean(dcg / idcg))
 
@@ -324,7 +325,7 @@ def evaluate(_sess, tf_eval, eval_feed_dict, eval_data, like, filters, recall_k,
         x.rows = preds_k
         x.data = np.ones_like(preds_k)
 
-        z = y.multiply(x)
+        z = y.toarray() * x.toarray()
         recall.append(np.mean(np.divide((np.sum(z, 1)), np.sum(y, 1))))
         precision.append(np.mean(np.sum(z, 1) / at_k))
 

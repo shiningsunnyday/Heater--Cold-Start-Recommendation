@@ -1,6 +1,8 @@
+from copy import deepcopy
 import utils
 import numpy as np
 import pandas as pd
+from sklearn import preprocessing as prep
 import tensorflow as tf
 import datetime
 from sklearn import datasets
@@ -10,7 +12,9 @@ import scipy.sparse as sp
 
 import argparse
 from tqdm import tqdm
+import pdb
 import pickle
+import json
 
 np.random.seed(0)
 tf.set_random_seed(0)
@@ -21,7 +25,7 @@ def main():
     data_name = args.data
     model_select = args.model_select
     rank_out = args.rank
-    data_batch_size = 1024
+    data_batch_size = 1000
     dropout = args.dropout
     recall_at = [20, 50, 100]
     eval_batch_size = 5000  # the batch size when test
@@ -33,7 +37,13 @@ def main():
     _decay_lr_every = 10
     _lr_decay = 0.8
 
-    dat = load_data(data_name)
+    if data_name == "anime_cold":
+        dat = load_data_anime_cold() 
+    elif data_name == "anime_warm":
+        dat = load_data_anime_warm()
+    else:
+        dat = load_data(data_name)
+    
     u_pref = dat['u_pref']
     v_pref = dat['v_pref']
     test_eval = dat['test_eval']
@@ -189,6 +199,109 @@ def tfidf(R):
     idf = sp.spdiags(idf, 0, col, col)
     return tf * idf
 
+def prep_standardize_dense(x):
+    scaler = prep.StandardScaler().fit(x)
+    x_scaled = scaler.transform(x)
+    x_scaled[x_scaled > 5] = 5
+    x_scaled[x_scaled < -5] = -5
+    x_scaled[np.absolute(x_scaled) < 1e-5] = 0
+    return scaler, x_scaled
+
+ANIME_PATH="/dfs/user/msun415/anime/data/anime/train_val_test/10000"
+
+def dict_to_sorted_array(dic):
+    return np.array([x[1] for x in sorted(dic.items(),key=lambda x:int(x[0]))])
+
+def dict_sorted_indices(dic):
+    return sorted(list(dic.keys()))
+
+def load_data_anime_cold():
+    VAR_NAMES=['u_feats','v_feats','val_v_feats']
+    for j in VAR_NAMES: 
+        dic=json.load(open(f"/dfs/user/msun415/anime/cached/anime2vec/bert-pretrained/{j}.json"))
+        globals()[j]={int(float(k)):np.array(dic[k]) for k in dic}
+
+    v_feats = np.array(list(globals()['v_feats'].values()))
+    val_v_feats = np.array(list(globals()['val_v_feats'].values()))
+    v_feats_comb_np = np.concatenate((v_feats,val_v_feats),axis=0)
+    
+    user_path="{}/10000_train_user_factors.csv".format(ANIME_PATH)
+    item_path="{}/10000_train_item_factors.csv".format(ANIME_PATH)
+    pref_path="{}/10000_train_pref_matrix.csv".format(ANIME_PATH)
+    val_pref_path="{}/10000_val_pref_matrix.csv".format(ANIME_PATH)
+    pref_matrix=pd.read_csv(pref_path).iloc[:,1:]
+    val_pref_matrix=pd.read_csv(val_pref_path).iloc[:,1:]
+    pref_mask=pref_matrix>0.0
+    val_pref_mask=val_pref_matrix>0.0
+   
+    user_vectors=pd.read_csv(user_path).iloc[:,1:]
+    item_vectors=pd.read_csv(item_path).iloc[:,1:]
+    u,v=user_vectors.values,item_vectors.values
+    _,u=prep_standardize_dense(u)
+    _,v=prep_standardize_dense(v)
+    v_dict_comb = np.concatenate((v,np.zeros((len(val_v_feats), 200))),axis=0)
+
+    dat = {}
+    dat['u_pref'] = u
+    dat['v_pref'] = v_dict_comb
+    dat['item_content'] = v_feats_comb_np
+
+    train_arg_indices = np.argwhere(pref_mask.values==1)
+    pd.DataFrame(train_arg_indices,columns=['uid','iid']).to_csv(f"{ANIME_PATH}/train.csv",index=False)
+    val_arg_indices = np.argwhere(val_pref_mask.values==1)
+    val_arg_indices[:,1] = val_arg_indices[:,1] + 8000
+    pd.DataFrame(val_arg_indices,columns=['uid','iid']).to_csv(f"{ANIME_PATH}/test.csv",index=False)
+   
+    train = pd.read_csv(f"{ANIME_PATH}/train.csv", dtype=np.int32)
+    dat['user_list'] = train['uid'].values
+    dat['item_list'] = train['iid'].values
+    dat['test_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")
+    dat['vali_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")
+
+    return dat
+
+
+def load_data_anime_warm():
+    VAR_NAMES=['u_feats','v_feats','val_v_feats']
+    for j in VAR_NAMES: 
+        dic=json.load(open(f"/dfs/user/msun415/anime/cached/anime2vec/bert-pretrained/{j}.json"))
+        globals()[j]={int(float(k)):np.array(dic[k]) for k in dic}
+
+    v_feats_comb = deepcopy(v_feats)
+    v_feats_comb.update(val_v_feats)
+    
+    user_path="{}/10000_warm_user_factors_large.csv".format(ANIME_PATH)
+    item_path="{}/10000_train_item_factors.csv".format(ANIME_PATH)
+    pref_matrix,val_pref_matrix=pd.read_csv("{}/10000_warm_pref_matrix_train_0.csv".format(ANIME_PATH),index_col=0),pd.read_csv("{}/10000_warm_pref_matrix_test_0.csv".format(ANIME_PATH),index_col=0)
+    pref_mask=pref_matrix>0.0
+    val_pref_mask=val_pref_matrix>0.0
+    warm_user_factors=pd.read_csv("{}/10000_warm_user_factors_large.csv".format(ANIME_PATH),index_col=0)
+    warm_item_factors=pd.read_csv("{}/10000_warm_item_factors_large.csv".format(ANIME_PATH),index_col=0)
+
+    pd.DataFrame(np.argwhere(pref_mask.values==1),columns=['uid','iid']).to_csv(f"{ANIME_PATH}/train.csv",index=False)
+    pd.DataFrame(np.argwhere(val_pref_mask.values==1),columns=['uid','iid']).to_csv(f"{ANIME_PATH}/vali.csv",index=False)
+
+    user_df=pd.read_csv(user_path)    
+    item_df=pd.read_csv(item_path)    
+    user_ids=user_df.iloc[:,0]#inds
+    train_ids=list(v_feats.keys())
+    val_ids=list(val_v_feats.keys())
+    u,v=warm_user_factors.values,warm_item_factors.values
+    _,u=prep_standardize_dense(u)
+    _,v=prep_standardize_dense(v)
+
+    dat = {}
+    dat['u_pref'] = u
+    dat['v_pref'] = v
+    dat['item_content'] = dict_to_sorted_array(v_feats_comb)
+
+    train = pd.read_csv(f"{ANIME_PATH}/train.csv", dtype=np.int32)
+    dat['user_list'] = train['uid'].values
+    dat['item_list'] = train['iid'].values
+    dat['test_eval'] = data.load_eval_data(f"{ANIME_PATH}/vali.csv")
+    dat['vali_eval'] = data.load_eval_data(f"{ANIME_PATH}/vali.csv")
+    return dat
+
 
 def load_data(data_name):
     timer = utils.timer(name='main').tic()
@@ -208,6 +321,8 @@ def load_data(data_name):
 
     u_pref = np.load('./data/CiteULike/U_BPR.npy')
     v_pref = np.load('./data/CiteULike/V_BPR.npy')
+
+    breakpoint()
 
     dat['u_pref'] = u_pref
     dat['v_pref'] = v_pref
@@ -268,4 +383,6 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
     for key in vars(args):
         print(key + ":" + str(vars(args)[key]))
+
     main()
+

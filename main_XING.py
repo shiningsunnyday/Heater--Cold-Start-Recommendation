@@ -9,9 +9,11 @@ import model
 
 import argparse
 import pickle
+from sklearn import preprocessing as prep
 from tqdm import tqdm
 import scipy.sparse
-
+import json
+from copy import deepcopy
 np.random.seed(0)
 tf.set_random_seed(0)
 
@@ -32,7 +34,12 @@ def main():
     _decay_lr_every = 3
     _lr_decay = 0.8
 
-    dat = load_data(data_name)
+    if data_name == "anime_cold":
+        dat = load_data_anime_cold() 
+    elif data_name == "anime_warm":
+        dat = load_data_anime_warm()
+    else:
+        dat = load_data(data_name)
     test_item_eval = dat['test_item_eval']
     test_user_eval = dat['test_user_eval']
     test_user_item_eval = dat['test_user_item_eval']
@@ -119,8 +126,8 @@ def main():
                     zero_item_index = np.array([])
                     zero_user_index = np.array([])
 
-                item_content_batch = item_content[batch_items, :].todense()
-                user_content_batch = user_content[batch_users, :].todense()
+                item_content_batch = item_content[batch_items, :]
+                user_content_batch = user_content[batch_users, :]
                 dropout_item_indicator = np.zeros_like(batch_targets).reshape((-1, 1))
                 if len(zero_item_index) > 0:
                     dropout_item_indicator[zero_item_index] = 1
@@ -306,6 +313,71 @@ def main():
             ))
 
 
+ANIME_PATH="/dfs/user/msun415/anime/data/anime/train_val_test/10000"
+
+
+def prep_standardize_dense(x):
+    scaler = prep.StandardScaler().fit(x)
+    x_scaled = scaler.transform(x)
+    x_scaled[x_scaled > 5] = 5
+    x_scaled[x_scaled < -5] = -5
+    x_scaled[np.absolute(x_scaled) < 1e-5] = 0
+    return scaler, x_scaled
+
+def load_data_anime_cold():
+    VAR_NAMES=['u_feats','v_feats','val_v_feats']
+    for j in VAR_NAMES: 
+        dic=json.load(open(f"/dfs/user/msun415/anime/cached/anime2vec/bert-pretrained/{j}.json"))
+        globals()[j]={int(float(k)):np.array(dic[k]) for k in dic}
+
+    v_feats_comb = deepcopy(v_feats)
+    v_feats_comb.update(val_v_feats)
+    
+    user_path="{}/10000_train_user_factors.csv".format(ANIME_PATH)
+    item_path="{}/10000_train_item_factors.csv".format(ANIME_PATH)
+    pref_path="{}/10000_train_pref_matrix.csv".format(ANIME_PATH)
+    val_pref_path="{}/10000_val_pref_matrix.csv".format(ANIME_PATH)
+    pref_matrix=pd.read_csv(pref_path).iloc[:,1:]
+    val_pref_matrix=pd.read_csv(val_pref_path).iloc[:,1:]
+    pref_mask=pref_matrix>0.0
+    val_pref_mask=val_pref_matrix>0.0
+
+    user_df=pd.read_csv(user_path)    
+    item_df=pd.read_csv(item_path)    
+    user_vectors=pd.read_csv(user_path).iloc[:,1:]
+    item_vectors=pd.read_csv(item_path).iloc[:,1:]
+    user_ids=user_df.iloc[:,0]#inds
+    train_ids=list(v_feats.keys())
+    val_ids=list(val_v_feats.keys())
+    u,v=user_vectors.values,item_vectors.values
+    _,u=prep_standardize_dense(u)
+    _,v=prep_standardize_dense(v)
+    u_dict=dict(zip(user_ids,u))#{user_ind:item_vec}
+    v_dict=dict(zip(train_ids,v))#{anime_ind:item_vec}
+    val_v_dict=dict(zip(val_ids, np.zeros((len(val_ids), 200))))
+    v_dict_comb = deepcopy(v_dict)
+    v_dict_comb.update(val_v_dict)
+
+    dat = {}
+    dat['u_pref'] = u
+    dat['v_pref'] = np.array(list(v_dict_comb.values()))   
+    dat['item_content'] = np.array(list(v_feats_comb.values()))
+    dat['user_content'] = np.array(list(u_feats.values()))
+    
+    pd.DataFrame(np.argwhere(pref_mask.values==1),columns=['uid','iid']).to_csv(f"{ANIME_PATH}/train.csv",index=False)
+    pd.DataFrame(np.argwhere(val_pref_mask.values==1),columns=['uid','iid']).to_csv(f"{ANIME_PATH}/test.csv",index=False)
+    train = pd.read_csv(f"{ANIME_PATH}/train.csv", dtype=np.int32)
+    dat['user_list'] = train['uid'].values
+    dat['item_list'] = train['iid'].values
+    dat['vali_item_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")
+    dat['vali_user_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")
+    dat['test_item_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")
+    dat['test_user_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")
+    dat['test_user_item_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")    
+    dat['vali_user_item_eval'] = data.load_eval_data(f"{ANIME_PATH}/test.csv")    
+    return dat
+
+
 def load_data(data_name):
     timer = utils.timer(name='main').tic()
     data_path = './data/' + data_name
@@ -362,6 +434,7 @@ def load_data(data_name):
     dat['vali_item_eval'] = data.load_eval_data(vali_item_file)
     dat['vali_user_eval'] = data.load_eval_data(vali_user_file, cold_user=True, test_item_ids=dat['warm_item'])
     dat['vali_user_item_eval'] = data.load_eval_data(vali_user_item_file)
+    breakpoint()
     return dat
 
 
